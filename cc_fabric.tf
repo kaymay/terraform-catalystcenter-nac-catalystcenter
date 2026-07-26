@@ -21,6 +21,25 @@ locals {
     ]
   ])
 
+  # An anycast gateway belongs to the "anchoring" (extended/inherited) set when its
+  # virtual network is anchored elsewhere: the VN has an anchor_site and this pool
+  # sits on a different fabric site than that anchor. Anchor-site pools and all
+  # non-anchored pools stay in the base set, keyed by bare ip_pool_name for backward
+  # compatibility with pre-anchoring state.
+  anycast_gateways_anchoring = {
+    for anycast_gateway in local.anycast_gateways :
+    "${anycast_gateway.fabric_site_name}#_#${anycast_gateway.ip_pool_name}" => anycast_gateway
+    if try(local.anchored_vn_lookup[anycast_gateway.l3_virtual_network], null) != null
+    && anycast_gateway.fabric_site_name != local.anchored_vn_lookup[anycast_gateway.l3_virtual_network]
+  }
+
+  anycast_gateways_base = {
+    for anycast_gateway in local.anycast_gateways :
+    anycast_gateway.ip_pool_name => anycast_gateway
+    if !(try(local.anchored_vn_lookup[anycast_gateway.l3_virtual_network], null) != null
+    && anycast_gateway.fabric_site_name != local.anchored_vn_lookup[anycast_gateway.l3_virtual_network])
+  }
+
   anycast_gateways_by_fabric_site = {
     for fabric_site in try(local.catalyst_center.fabric.fabric_sites, []) :
     fabric_site.name => [
@@ -323,7 +342,10 @@ resource "catalystcenter_fabric_l3_virtual_network" "l3_vn" {
   ] : null
   anchored_site_id = try(local.combined_fabric_id_list[local.anchored_vn_lookup[each.key]], null)
 
-  depends_on = [catalystcenter_ip_pool_reservation.pool_reservation, catalystcenter_fabric_site.fabric_site, catalystcenter_fabric_zone.fabric_zone]
+  # Destroy-order constraint: Catalyst Center rejects removing a fabric CP/External
+  # Border device while a VN is still anchored at that site (NCSO20486). Depending on
+  # the fabric_device resources forces the anchored VN to be destroyed before them.
+  depends_on = [catalystcenter_ip_pool_reservation.pool_reservation, catalystcenter_fabric_site.fabric_site, catalystcenter_fabric_zone.fabric_zone, catalystcenter_fabric_device.border_device, catalystcenter_fabric_device.wireless_controller, catalystcenter_fabric_device.edge_device, catalystcenter_fabric_devices.fabric_devices, catalystcenter_fabric_devices.fabric_devices_zone]
 }
 
 resource "catalystcenter_fabric_l2_virtual_network" "l2_vn" {
@@ -383,7 +405,7 @@ resource "catalystcenter_fabric_l2_virtual_network" "l2_vn_zone" {
 }
 
 resource "catalystcenter_anycast_gateway" "anycast_gateway" {
-  for_each = { for anycast_gateway in local.anycast_gateways : "${anycast_gateway.fabric_site_name}#_#${anycast_gateway.ip_pool_name}" => anycast_gateway if contains(local.sites, anycast_gateway.fabric_site_name) && var.use_bulk_api == false }
+  for_each = { for key, anycast_gateway in local.anycast_gateways_base : key => anycast_gateway if contains(local.sites, anycast_gateway.fabric_site_name) && var.use_bulk_api == false }
 
   fabric_id                                 = catalystcenter_fabric_site.fabric_site[each.value.fabric_site_name].id
   virtual_network_name                      = try(each.value.l3_virtual_network, local.defaults.catalyst_center.fabric.fabric_sites.anycast_gateways.l3_virtual_network, null)
@@ -405,6 +427,35 @@ resource "catalystcenter_anycast_gateway" "anycast_gateway" {
   group_based_policy_enforcement_enabled    = lookup(each.value, "pool_type", "") == "EXTENDED_NODE" ? try(each.value.group_based_policy_enforcement_enabled, local.defaults.catalyst_center.fabric.fabric_sites.anycast_gateways.group_based_policy_enforcement_enabled, null) : null
 
   depends_on = [catalystcenter_ip_pool_reservation.pool_reservation, catalystcenter_fabric_site.fabric_site, catalystcenter_fabric_l3_virtual_network.l3_vn, catalystcenter_virtual_network_to_fabric_site.l3_vn_to_fabric_site]
+}
+
+# Extended/inherited-site anycast gateways for anchored virtual networks. Depending on
+# the base anycast_gateway resource forces create order anchor-first / extended-after
+# and destroy order extended-first / anchor-last, which Catalyst Center requires: the
+# inherited pool cannot be removed while the anchor still owns it (NCSO20382).
+resource "catalystcenter_anycast_gateway" "anycast_gateway_anchoring" {
+  for_each = { for key, anycast_gateway in local.anycast_gateways_anchoring : key => anycast_gateway if contains(local.sites, anycast_gateway.fabric_site_name) && var.use_bulk_api == false }
+
+  fabric_id                                 = catalystcenter_fabric_site.fabric_site[each.value.fabric_site_name].id
+  virtual_network_name                      = try(each.value.l3_virtual_network, local.defaults.catalyst_center.fabric.fabric_sites.anycast_gateways.l3_virtual_network, null)
+  ip_pool_name                              = try(each.value.ip_pool_name, null)
+  vlan_name                                 = try(each.value.vlan_name, local.defaults.catalyst_center.fabric.fabric_sites.anycast_gateways.vlan_name, null)
+  vlan_id                                   = try(each.value.vlan_id, local.defaults.catalyst_center.fabric.fabric_sites.anycast_gateways.vlan_id, null)
+  traffic_type                              = try(each.value.traffic_type, local.defaults.catalyst_center.fabric.fabric_sites.anycast_gateways.traffic_type, null)
+  critical_pool                             = lookup(each.value, "pool_type", "") == "FABRIC_AP" || lookup(each.value, "pool_type", "") == "EXTENDED_NODE" ? null : try(each.value.critical_pool, local.defaults.catalyst_center.fabric.fabric_sites.anycast_gateways.critical_pool, null)
+  intra_subnet_routing_enabled              = lookup(each.value, "pool_type", "") == "FABRIC_AP" || lookup(each.value, "pool_type", "") == "EXTENDED_NODE" ? null : try(each.value.intra_subnet_routing_enabled, local.defaults.catalyst_center.fabric.fabric_sites.anycast_gateways.intra_subnet_routing_enabled, null)
+  ip_directed_broadcast                     = lookup(each.value, "pool_type", "") == "FABRIC_AP" || lookup(each.value, "pool_type", "") == "EXTENDED_NODE" ? null : try(each.value.ip_directed_broadcast, local.defaults.catalyst_center.fabric.fabric_sites.anycast_gateways.ip_directed_broadcast, null)
+  l2_flooding_enabled                       = lookup(each.value, "pool_type", "") == "FABRIC_AP" || lookup(each.value, "pool_type", "") == "EXTENDED_NODE" ? null : try(each.value.layer2_flooding, local.defaults.catalyst_center.fabric.fabric_sites.anycast_gateways.layer2_flooding, null)
+  multiple_ip_to_mac_addresses              = lookup(each.value, "pool_type", "") == "FABRIC_AP" || lookup(each.value, "pool_type", "") == "EXTENDED_NODE" ? null : try(each.value.multiple_ip_to_mac_addresses, local.defaults.catalyst_center.fabric.fabric_sites.anycast_gateways.multiple_ip_to_mac_addresses, null)
+  wireless_pool                             = lookup(each.value, "pool_type", "") == "FABRIC_AP" || lookup(each.value, "pool_type", "") == "EXTENDED_NODE" ? null : try(each.value.wireless_pool, local.defaults.catalyst_center.fabric.fabric_sites.anycast_gateways.wireless_pool, null)
+  auto_generate_vlan_name                   = try(each.value.auto_generate_vlan_name, local.defaults.catalyst_center.fabric.fabric_sites.anycast_gateways.auto_generate_vlan_name, null)
+  pool_type                                 = try(each.value.pool_type, local.defaults.catalyst_center.fabric.fabric_sites.anycast_gateways.pool_type, null)
+  security_group_name                       = try(each.value.security_group_name, local.defaults.catalyst_center.fabric.fabric_sites.anycast_gateways.security_group_name, null)
+  supplicant_based_extended_node_onboarding = try(each.value.supplicant_based_extended_node_onboarding, local.defaults.catalyst_center.fabric.fabric_sites.anycast_gateways.supplicant_based_extended_node_onboarding, null)
+  tcp_mss_adjustment                        = try(each.value.tcp_mss_adjustment, local.defaults.catalyst_center.fabric.fabric_sites.anycast_gateways.tcp_mss_adjustment, null)
+  group_based_policy_enforcement_enabled    = lookup(each.value, "pool_type", "") == "EXTENDED_NODE" ? try(each.value.group_based_policy_enforcement_enabled, local.defaults.catalyst_center.fabric.fabric_sites.anycast_gateways.group_based_policy_enforcement_enabled, null) : null
+
+  depends_on = [catalystcenter_ip_pool_reservation.pool_reservation, catalystcenter_fabric_site.fabric_site, catalystcenter_fabric_l3_virtual_network.l3_vn, catalystcenter_virtual_network_to_fabric_site.l3_vn_to_fabric_site, catalystcenter_anycast_gateway.anycast_gateway]
 }
 
 resource "catalystcenter_anycast_gateway" "anycast_gateway_zone" {
@@ -799,7 +850,8 @@ locals {
         null
       ) :
       try(
-        catalystcenter_anycast_gateway.anycast_gateway["${item.fabric_site_name}#_#${item.ip_pool_name}"].vlan_id,
+        catalystcenter_anycast_gateway.anycast_gateway_anchoring["${item.fabric_site_name}#_#${item.ip_pool_name}"].vlan_id,
+        catalystcenter_anycast_gateway.anycast_gateway[item.ip_pool_name].vlan_id,
         one([
           for g in local.anycast_gateways_by_fabric_site[item.fabric_site_name] :
           g.vlan_id
