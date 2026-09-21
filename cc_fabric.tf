@@ -1328,14 +1328,14 @@ locals {
 }
 
 resource "terraform_data" "anchor_change_guard" {
-  for_each = { for name, blocked in local.anchor_guard_block : name => blocked if blocked }
+  for_each = local.anchored_vn_lookup
 
   input = each.key
 
   lifecycle {
     precondition {
-      # This instance only exists when local.anchor_guard_block[each.key] is true
-      condition     = !local.anchor_guard_block[each.key]
+      # Blocked-ness is evaluated here (unknowns tolerated), never in for_each membership
+      condition     = !try(local.anchor_guard_block[each.key], false)
       error_message = "This Virtual Network '${each.key}' has already been Anchored to a site and its Anchor Role cannot be changed, without first removing the VN with its associated anycast gateway from ALL existing fabric sites (Anchor + Anchoring sites). Unassociate the VN from all fabric sites, apply, then configure the new anchor site in a subsequent apply."
     }
   }
