@@ -1310,7 +1310,7 @@ locals {
   anchor_guard_block = {
     for name, desired_anchor_path in local.anchored_vn_lookup : name => (
       try(data.catalystcenter_fabric_l3_virtual_network.anchor_guard[name].anchored_site_id, "") != "" &&
-      length(compact(try(data.catalystcenter_fabric_l3_virtual_network.anchor_guard[name].fabric_ids, []))) > 0 &&
+      length(compact(coalesce(try(data.catalystcenter_fabric_l3_virtual_network.anchor_guard[name].fabric_ids, []), []))) > 0 &&
       (
         (
           desired_anchor_path != null &&
