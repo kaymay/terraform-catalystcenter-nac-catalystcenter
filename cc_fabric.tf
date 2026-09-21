@@ -1319,7 +1319,7 @@ locals {
           data.catalystcenter_fabric_l3_virtual_network.anchor_guard[name].anchored_site_id != local.guard_fabric_site_uuids[desired_anchor_path]
         ) ||
         (
-          contains(local.guard_fabric_site_uuid_values, data.catalystcenter_fabric_l3_virtual_network.anchor_guard[name].anchored_site_id) &&
+          contains(toset(values(local.fabric_site_id_list)), data.catalystcenter_fabric_l3_virtual_network.anchor_guard[name].anchored_site_id) &&
           (desired_anchor_path == null || !contains(local.sites, desired_anchor_path))
         )
       )
