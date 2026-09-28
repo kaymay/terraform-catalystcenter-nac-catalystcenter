@@ -1278,7 +1278,6 @@ resource "catalystcenter_fabric_port_channel" "port_channel" {
   depends_on = [catalystcenter_fabric_device.edge_device, catalystcenter_fabric_device.border_device, catalystcenter_fabric_devices.fabric_devices, catalystcenter_fabric_devices.fabric_devices_zone, catalystcenter_provision_devices.provision_devices, catalystcenter_provision_device.provision_device]
 }
 
-
 # Anchor-role change guard
 #considers three scenarios, each with its own message:
 #
@@ -1324,9 +1323,20 @@ locals {
     name => anchor_id != null && anchor_id != ""
   }
 
-  guard_live_on_fabric_sites = {
+  guard_live_fabric_site_count = {
     for name, _ in local.global_l3_virtual_networks :
-    name => length(compact(coalesce(try(data.catalystcenter_fabric_l3_virtual_network.anchor_guard[name].fabric_ids, []), []))) > 0
+    name => length(compact(coalesce(try(data.catalystcenter_fabric_l3_virtual_network.anchor_guard[name].fabric_ids, []), [])))
+  }
+
+  guard_live_on_fabric_sites = {
+    for name, count in local.guard_live_fabric_site_count : name => count > 0
+  }
+
+  # Both adding and removing an anchor require the VN to sit on the anchor site
+  # alone: the add path shrinks to the anchor before setting it, and the remove
+  # path cannot detach an anchor while anchoring child sites still hold the VN.
+  guard_live_on_multiple_fabric_sites = {
+    for name, count in local.guard_live_fabric_site_count : name => count > 1
   }
 
   guard_live_vn_exists = {
@@ -1364,7 +1374,7 @@ locals {
     for name, _ in local.global_l3_virtual_networks : name => (
       !local.guard_live_is_anchored[name] &&
       local.guard_live_vn_exists[name] &&
-      local.guard_live_on_fabric_sites[name] &&
+      local.guard_live_on_multiple_fabric_sites[name] &&
       local.guard_desired_anchor_path[name] != null
     )
   }
@@ -1372,7 +1382,7 @@ locals {
   guard_anchor_removed = {
     for name, _ in local.global_l3_virtual_networks : name => (
       local.guard_anchor_locally_managed[name] &&
-      local.guard_live_on_fabric_sites[name] &&
+      local.guard_live_on_multiple_fabric_sites[name] &&
       local.guard_desired_anchor_path[name] == null
     )
   }
@@ -1382,9 +1392,9 @@ locals {
       local.guard_anchor_changed[name] ?
       "Virtual Network '${name}' is already anchored to a fabric site and its anchor cannot be moved to a different site while the VN is still associated with fabric sites. This is a Catalyst Center API limitation. Remove the VN and its anycast gateways from ALL fabric sites (anchor + anchoring sites), apply, then set the new anchor_site in a subsequent apply." :
       local.guard_anchor_added[name] ?
-      "Virtual Network '${name}' already exists on Catalyst Center without an anchor, and an anchor cannot be added to an existing Layer 3 Virtual Network. This is a Catalyst Center API limitation. Remove the VN and its anycast gateways from ALL fabric sites it is currently associated with, apply, then re-add the VN with anchor_site set in a subsequent apply." :
+      "Virtual Network '${name}' already exists on Catalyst Center and is associated across multiple fabric sites without an anchor, and an anchor cannot be added to an existing Layer 3 Virtual Network that spans more than one fabric site. This is a Catalyst Center API limitation. Remove the VN and its anycast gateways from ALL fabric sites it is currently associated with, apply, then re-add the VN with anchor_site set in a subsequent apply." :
       local.guard_anchor_removed[name] ?
-      "Virtual Network '${name}' is anchored and is still associated with fabric sites, so its anchor cannot be removed. This is a Catalyst Center API limitation. Remove the VN and its anycast gateways from ALL anchoring (child) fabric sites first, apply, then remove anchor_site in a subsequent apply." :
+      "Virtual Network '${name}' is anchored and is still associated with one or more anchoring (child) fabric sites, so its anchor cannot be removed. This is a Catalyst Center API limitation. Remove the VN and its anycast gateways from ALL anchoring (child) fabric sites first, apply, then remove anchor_site in a subsequent apply." :
       ""
     )
   }
